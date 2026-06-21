@@ -353,7 +353,7 @@ constexpr uint32_t threads_per_block = 256;
 // constexpr uint32_t threads_per_run = UINT64_C(1) << 10;
 // constexpr uint32_t threads_per_run = UINT64_C(1) << 22;
 // constexpr uint32_t threads_per_run = UINT64_C(1) << 25;
-constexpr uint32_t threads_per_run = UINT64_C(1) << 28;
+constexpr uint32_t threads_per_run = UINT64_C(1) << 28; //28
 
 __device__ XrsrRandomFork noise_yo_fork(XrsrRandomFork noise_fork) {
   uint64_t l = noise_fork.lo;
@@ -727,7 +727,7 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<uint64_t> seeds, OutputBu
         conv += conv_z[1][dnx][w1[dnx] + nz];
       }
 
-      if (conv >= -19) {
+      if (conv >= -18.5) { // 19
         uint32_t result_index = atomicAdd(outputs.len, 1);
         if (result_index < outputs.max_len){
           outputs.data[result_index] = {seed_index, x, z};
@@ -766,7 +766,7 @@ void run(InputBuffer<uint64_t> seeds, OutputBuffer<SeedPos> outputs, KernelSeed1
 
 namespace KernelFilterGradVecs2 {
 constexpr uint32_t block_dim_x = 128;
-constexpr uint32_t grid_width = large_biomes ? 28 : 114;
+constexpr uint32_t grid_width = 330;
 constexpr uint32_t grid_half = grid_width / 2;
 constexpr uint32_t threads_per_seed = grid_width * grid_width;
 __global__
@@ -780,7 +780,7 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<SeedPos> inputs, OutputBu
 
   constexpr int32_t cell_size_0A = (int32_t)(1 / chosen_continentalness_config.octaves_a[0].input_factor) * 256;
 
-  static_assert(cell_size_0A * grid_width * 4 < 60E6);
+  static_assert(cell_size_0A * grid_width * 4 < 700E6);
 
   uint32_t inputs_len = *inputs.len;
   for (uint32_t input_index = blockIdx.x; input_index < inputs_len; input_index += gridDim.x) {
@@ -1386,10 +1386,9 @@ void GpuThread::run() {
       // // 6m | P(X < x) = <0.01
       // KernelFilter2::Template<-7400, 2, 6 * 1024, 512, 63, false, true>::run,
       // // 6m | P(X < x) = <0.01
-      KernelFilter2::Template<-10500, 18, 8 * 1024, 256, 20, false, true, false>::run, // 6m | P(X < x) = <0.01
-      KernelFilter2::Template<-10500, 18, 8 * 1024, 1024, 90, false, true, false>::run, // 6m | P(X < x) = <0.01
-      KernelFilter2::Template<-10500, 18, 8 * 1024, 16384, 1600, false, false, false>::run, // 6m | P(X < x) = <0.01
-      KernelFilter2::Template<-10500, 18, 8 * 1024, 65536, 6600, false, false, false>::run, // 6m | P(X < x) = <0.01
+      KernelFilter2::Template<-10500, 12, 8 * 1024, 256, 23, false, true, false>::run, 
+      KernelFilter2::Template<-10500, 14, 8 * 1024, 1024, 110, false, true, false>::run, 
+      KernelFilter2::Template<-10500, 18, 10 * 1024, 16384, 1440, false, false, false>::run, // zajonc was here :D, use 1560 instead of 1440 because of colab shitty cpus
   };
   std::vector<Filter2Stage> filter_2;
   {
@@ -1406,7 +1405,7 @@ void GpuThread::run() {
     }
   }
 
-  int print_interval = 640;
+  int print_interval = 4096;
 
   // for (int32_t nx = 0; nx < 256; nx++) {
   //     for (int32_t nz = 0; nz < 256; nz++) {
