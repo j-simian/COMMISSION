@@ -345,7 +345,7 @@ __device__ inline void XrsrRandom_double_fork(XrsrRandom &rng, XrsrRandomFork &f
 
 namespace KernelFilterSeeds {
 constexpr uint32_t threads_per_block = 256;
-constexpr uint32_t threads_per_run = UINT64_C(1) << 28; //28
+constexpr uint32_t threads_per_run = seeds_per_gpu_iteration;
 
 __device__ XrsrRandomFork noise_yo_fork(XrsrRandomFork noise_fork) {
   uint64_t l = noise_fork.lo;
@@ -1666,8 +1666,8 @@ struct BufferLens {
 };
 
 
-GpuThread::GpuThread(int device, SeedIterator &input, GpuOutputs &outputs)
-    : Thread(), device(device), input(input), outputs(outputs) {
+GpuThread::GpuThread(int device, SeedIterator &input, GpuOutputs &outputs, bool benchmark)
+    : Thread(), device(device), input(input), outputs(outputs), benchmark(benchmark) {
   start();
 }
 
@@ -1760,8 +1760,14 @@ void GpuThread::run() {
 
   auto start = std::chrono::steady_clock::now();
 
+  uint64_t benchmark_checksum_seed = 0;
+  uint64_t benchmark_checksum_x = 0;
+  uint64_t benchmark_checksum_z = 0;
+  uint64_t benchmark_total_results = 0;
+
   for (uint32_t i = 0; !should_stop(); i++) {
     uint64_t start_seed = input.next(KernelFilterSeeds::threads_per_run);
+    if (start_seed == UINT64_MAX) break;
 
     TRY_CUDA(cudaMemsetAsync(device_buffer_lens, 0, sizeof(*device_buffer_lens), stream));
 
@@ -1850,11 +1856,17 @@ void GpuThread::run() {
           uint64_t seed;
           TRY_CUDA(cudaMemcpy(&seed, &outputs_filter_seeds.data[result.seed_index], sizeof(seed), cudaMemcpyDeviceToHost));
           outputs.queue.push({seed, result.x * 4, result.z * 4});
+          if (benchmark) {
+            benchmark_checksum_seed ^= seed;
+            benchmark_checksum_x ^= (uint64_t)(uint32_t)(result.x * 4);
+            benchmark_checksum_z ^= (uint64_t)(uint32_t)(result.z * 4);
+            benchmark_total_results++;
+          }
         }
       }
     }
 
-    if ((i + 1) % PRINT_INTERVAL == 0) {
+    if (!benchmark && (i + 1) % PRINT_INTERVAL == 0) {
       auto end = std::chrono::steady_clock::now();
       double host_total_time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1e-9;
 
@@ -1900,6 +1912,46 @@ void GpuThread::run() {
       }
       start = end;
     }
+  }
+
+  if (benchmark) {
+    auto end = std::chrono::steady_clock::now();
+    double host_total_time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1e-9;
+
+    std::printf("\n=== Benchmark Results (device %d) ===\n", device);
+
+    double kernel_total_time = 0;
+    for (auto &stage : stage_stats) {
+      uint64_t scaled_total_inputs = stage.total_inputs * stage.inputs_multiplier;
+      auto [scaled_input_speed, input_speed_unit] = scale_si(scaled_total_inputs / stage.total_time);
+      auto [scaled_output_speed, output_speed_unit] = scale_si(stage.total_outputs / stage.total_time);
+      std::printf("%-20s - %9.3f ms | %7.3f %% | %12" PRIu64 " -> %12" PRIu64
+                  " | 1 in %11.3f | %7.3f %cips | %7.3f %cops\n",
+                  stage.name.c_str(), stage.total_time * 1e3,
+                  stage.total_time / host_total_time * 100.0,
+                  scaled_total_inputs, stage.total_outputs,
+                  (double)scaled_total_inputs / stage.total_outputs,
+                  scaled_input_speed, input_speed_unit, scaled_output_speed,
+                  output_speed_unit);
+      kernel_total_time += stage.total_time;
+    }
+
+    uint64_t total_inputs = stage_filter_seeds.total_inputs * stage_filter_seeds.inputs_multiplier;
+    uint64_t total_outputs = filter_2.back().stage.total_outputs;
+    auto [scaled_input_speed, input_speed_unit] = scale_si(total_inputs / host_total_time);
+    auto [scaled_output_speed, output_speed_unit] = scale_si(total_outputs / host_total_time);
+    std::printf(
+        "total                - %9.3f ms | %7.3f %% | %12" PRIu64
+        " -> %12" PRIu64 " |                  | %7.3f %cips | %7.3f %cops\n",
+        host_total_time * 1e3, kernel_total_time / host_total_time * 100.0,
+        total_inputs, total_outputs, scaled_input_speed, input_speed_unit,
+        scaled_output_speed, output_speed_unit);
+
+    std::printf("\nTotal time: %.3f s\n", host_total_time);
+    std::printf("Total seeds: %" PRIu64 "\n", total_inputs);
+    std::printf("Total results: %" PRIu64 "\n", benchmark_total_results);
+    std::printf("checksum: %016" PRIx64 "%016" PRIx64 "%016" PRIx64 "\n",
+                benchmark_checksum_seed, benchmark_checksum_x, benchmark_checksum_z);
   }
 
   TRY_CUDA(cudaStreamDestroy(stream));

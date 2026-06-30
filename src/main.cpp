@@ -83,6 +83,7 @@ struct Args {
     std::optional<std::string> output_file;
     std::optional<int64_t> start_seed;
     std::optional<int32_t> min_size;
+    std::optional<int32_t> benchmark;
 
     bool parse(int argc, const char **const argv) {
         for (int i = 1; i < argc;) {
@@ -132,6 +133,8 @@ struct Args {
                 if (!parse_argument_int(argc, argv, i, start_seed, [](int64_t start_seed){ return true; }, arg)) return false;
             } else if (std::strcmp("--size", arg) == 0) {
                 if (!parse_argument_int(argc, argv, i, min_size, [](int32_t min_size){ return min_size >= 0; }, arg)) return false;
+            } else if (std::strcmp("--benchmark", arg) == 0) {
+                if (!parse_argument_int(argc, argv, i, benchmark, [](int32_t n){ return n >= 1; }, arg)) return false;
             } else {
                 std::fprintf(stderr, "unknown option: %s\n", arg);
                 return false;
@@ -145,6 +148,11 @@ struct Args {
 
         if (output_file && client) {
             std::fprintf(stderr, "--output and --client are mutually exclusive\n");
+            return false;
+        }
+
+        if (benchmark && (threads || client || server)) {
+            std::fprintf(stderr, "--benchmark is mutually exclusive with --threads, --client, --server\n");
             return false;
         }
 
@@ -174,11 +182,12 @@ uint64_t random_start_seed() {
 int main_inner(int argc, char **argv) {
     Args args{};
     if (!args.parse(argc, const_cast<const char **const>(argv))) {
-        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--size <min_size>]\n", argv[0]);
+        std::fprintf(stderr, "Usage:\n%s [--device <device>,<device>,...] [--threads <threads>] [--client <server_address>] [--server <listen_address>] [--output <output_file>] [--start <start_seed>] [--size <min_size>] [--benchmark <iterations>]\n", argv[0]);
         return 1;
     }
 
-    const int threads = args.threads.value_or(args.client ? 0 : 1);
+    const bool benchmark = (bool)args.benchmark;
+    const int threads = benchmark ? 0 : args.threads.value_or(args.client ? 0 : 1);
     int32_t min_size = args.min_size.value_or(10'000'000 * (large_biomes ? 16 : 1));
     if (threads != 0) {
         std::printf("min_size = %" PRIi32 "\n", min_size);
@@ -199,6 +208,10 @@ int main_inner(int argc, char **argv) {
 
     std::printf("Hello! large_biomes = %s\nunbound: %s\nprint interval: %d\n", large_biomes ? "true" : "false", unbound ? "true" : "false", PRINT_INTERVAL);
 
+    if (benchmark) {
+        std::printf("Benchmark mode: %" PRIi32 " iterations\n", args.benchmark.value());
+    }
+
     std::FILE *output_file = nullptr;
     if (threads != 0) {
         const char *output_file_path = args.output_file ? args.output_file.value().c_str() : "output.txt";
@@ -215,92 +228,108 @@ int main_inner(int argc, char **argv) {
     CpuOutputs cpu_outputs;
 
 #ifndef NO_GPU
-    uint64_t start_seed = args.start_seed.value_or(random_start_seed());
+    uint64_t start_seed = args.start_seed.value_or(benchmark ? 0 : random_start_seed());
+    uint64_t end_seed = benchmark ? start_seed + (uint64_t)args.benchmark.value() * seeds_per_gpu_iteration : UINT64_MAX;
     std::printf("Starting from %" PRIi64 "\n", start_seed);
-    SeedIterator seed_range(start_seed);
+    if (benchmark) {
+        std::printf("End seed: %" PRIu64 " (%" PRIi32 " iterations x %u seeds/iter)\n",
+                    end_seed, args.benchmark.value(), seeds_per_gpu_iteration);
+    }
+    SeedIterator seed_range(start_seed, end_seed);
 
     std::vector<std::unique_ptr<GpuThread>> gpu_threads;
     for (int device : args.devices) {
-        gpu_threads.emplace_back(std::make_unique<GpuThread>(device, std::ref(seed_range), std::ref(gpu_outputs)));
+        gpu_threads.emplace_back(std::make_unique<GpuThread>(device, std::ref(seed_range), std::ref(gpu_outputs), benchmark));
     }
 #endif
 
 #ifndef NO_CPU
     std::vector<std::unique_ptr<CpuThread>> cpu_threads;
-    for (int i = 0; i < threads; i++) {
-        cpu_threads.emplace_back(std::make_unique<CpuThread>(i, min_size, std::ref(gpu_outputs), std::ref(cpu_outputs)));
+    if (!benchmark) {
+        for (int i = 0; i < threads; i++) {
+            cpu_threads.emplace_back(std::make_unique<CpuThread>(i, min_size, std::ref(gpu_outputs), std::ref(cpu_outputs)));
+        }
     }
 #endif
 
 #ifndef NO_NET
     std::unique_ptr<ClientThread> client_thread;
-    if (args.client) {
+    if (!benchmark && args.client) {
         client_thread = std::make_unique<ClientThread>(args.client.value(), std::ref(gpu_outputs));
     }
 
     std::unique_ptr<ServerThread> server_thread;
-    if (args.server) {
+    if (!benchmark && args.server) {
         server_thread = std::make_unique<ServerThread>(args.server.value(), std::ref(gpu_outputs));
     }
 #endif
 
-    for (size_t i = 0;; i++) {
-        if (threads != 0) {
-            std::lock_guard lock(cpu_outputs.mutex);
-            while (!cpu_outputs.queue.empty()) {
-                auto output = cpu_outputs.queue.front();
-                cpu_outputs.queue.pop();
-                std::printf("%" PRIi64 " at %" PRIi32 " %" PRIi32 " with %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
-                std::fprintf(output_file, "%" PRIi64 " %" PRIi32 " %" PRIi32 " %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
-                std::fflush(output_file);
+    if (benchmark) {
+        // Benchmark mode: wait for GPU threads to finish, then exit
+#ifndef NO_GPU
+        for (auto &thread : gpu_threads) {
+            (*thread).join();
+        }
+#endif
+    } else {
+        for (size_t i = 0;; i++) {
+            if (threads != 0) {
+                std::lock_guard lock(cpu_outputs.mutex);
+                while (!cpu_outputs.queue.empty()) {
+                    auto output = cpu_outputs.queue.front();
+                    cpu_outputs.queue.pop();
+                    std::printf("%" PRIi64 " at %" PRIi32 " %" PRIi32 " with %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
+                    std::fprintf(output_file, "%" PRIi64 " %" PRIi32 " %" PRIi32 " %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
+                    std::fflush(output_file);
+                }
             }
+
+            if (args.devices.size() == 0 && i % 10 == 0) {
+                std::lock_guard lock(gpu_outputs.mutex);
+                std::printf("gpu_outputs.queue.size() = %zu\n", gpu_outputs.queue.size());
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        if (args.devices.size() == 0 && i % 10 == 0) {
-            std::lock_guard lock(gpu_outputs.mutex);
-            std::printf("gpu_outputs.queue.size() = %zu\n", gpu_outputs.queue.size());
+#ifndef NO_GPU
+        for (auto &thread : gpu_threads) {
+            (*thread).stop();
         }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-
-#ifndef NO_GPU
-    for (auto &thread : gpu_threads) {
-        (*thread).stop();
-    }
 #endif
 #ifndef NO_CPU
-    for (auto &thread : cpu_threads) {
-        (*thread).stop();
-    }
+        for (auto &thread : cpu_threads) {
+            (*thread).stop();
+        }
 #endif
 #ifndef NO_NET
-    if (client_thread) {
-        (*client_thread).stop();
-    }
-    if (server_thread) {
-        (*server_thread).stop();
-    }
+        if (client_thread) {
+            (*client_thread).stop();
+        }
+        if (server_thread) {
+            (*server_thread).stop();
+        }
 #endif
 
 #ifndef NO_GPU
-    for (auto &thread : gpu_threads) {
-        (*thread).join();
-    }
+        for (auto &thread : gpu_threads) {
+            (*thread).join();
+        }
 #endif
 #ifndef NO_CPU
-    for (auto &thread : cpu_threads) {
-        (*thread).join();
-    }
+        for (auto &thread : cpu_threads) {
+            (*thread).join();
+        }
 #endif
 #ifndef NO_NET
-    if (client_thread) {
-        (*client_thread).join();
-    }
-    if (server_thread) {
-        (*server_thread).join();
-    }
+        if (client_thread) {
+            (*client_thread).join();
+        }
+        if (server_thread) {
+            (*server_thread).join();
+        }
 #endif
+    }
 
     if (output_file != nullptr) {
         std::fclose(output_file);
